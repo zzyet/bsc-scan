@@ -1,0 +1,47 @@
+version: "3.8"
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bsc
+      POSTGRES_PASSWORD: bsc123
+      POSTGRES_DB: bsc_scan
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bsc -d bsc_scan"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  bsc-scan:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./config.yaml:/etc/bsc-scan/config.yaml:ro
+    restart: unless-stopped
+    command: ["bsc-scan"]
+
+  bsc-admin:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./config.yaml:/etc/bsc-scan/config.yaml:ro
+    restart: unless-stopped
+    command: ["bsc-admin"]
+
+volumes:
+  pgdata:

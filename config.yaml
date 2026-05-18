@@ -1,0 +1,9 @@
+database:
+  dsn: "postgres://bsc:bsc123@localhost:5432/bsc_scan?sslmode=disable"
+  max_connections: 20
+scanner:
+  start_block: 0
+  worker_count: 5
+  batch_size: 50
+  poll_interval: 3s
+sync_interval: 5m

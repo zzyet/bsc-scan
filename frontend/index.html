@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BSC Scan Admin</title>
+<style>
+:root { --bg: #f5f6fa; --card: #fff; --primary: #533afd; --text: #1a1a2e; --muted: #6b7280; --border: #e5e7eb; --green: #10b981; --red: #ef4444; --amber: #f59e0b; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); }
+header { background: var(--card); border-bottom: 1px solid var(--border); padding: 0 24px; height: 56px; display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 10; }
+header h1 { font-size: 18px; font-weight: 700; color: var(--primary); }
+nav { display: flex; gap: 4px; }
+nav button { padding: 8px 16px; border: none; background: none; cursor: pointer; border-radius: 6px; font-size: 14px; color: var(--muted); transition: all .2s; }
+nav button:hover { background: #f3f4f6; color: var(--text); }
+nav button.active { background: #ede9fe; color: var(--primary); font-weight: 600; }
+main { max-width: 1200px; margin: 24px auto; padding: 0 24px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+.stat-card { background: var(--card); border-radius: 10px; padding: 20px; border: 1px solid var(--border); }
+.stat-card .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 4px; }
+.stat-card .value { font-size: 28px; font-weight: 700; }
+.panel { display: none; }
+.panel.active { display: block; }
+.card { background: var(--card); border-radius: 10px; border: 1px solid var(--border); padding: 20px; margin-bottom: 16px; }
+.card h3 { font-size: 16px; margin-bottom: 16px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; padding: 10px 12px; border-bottom: 2px solid var(--border); color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+td { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+tr:hover { background: #f9fafb; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+.badge-healthy { background: #d1fae5; color: #065f46; }
+.badge-unknown { background: #fef3c7; color: #92400e; }
+.badge-stopped { background: #fee2e2; color: #991b1b; }
+.badge-circuit { background: #fef3c7; color: #b45309; }
+.badge-unprocessed { background: #e0e7ff; color: #3730a3; }
+.badge-processed { background: #d1fae5; color: #065f46; }
+.btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; transition: all .2s; }
+.btn-primary { background: var(--primary); color: #fff; }
+.btn-primary:hover { opacity: .9; }
+.btn-danger { background: var(--red); color: #fff; }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+.modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,.4); z-index: 100; justify-content: center; align-items: center; }
+.modal.active { display: flex; }
+.modal-content { background: var(--card); border-radius: 12px; padding: 24px; width: 480px; max-height: 80vh; overflow-y: auto; }
+.modal-content h3 { margin-bottom: 16px; }
+.form-group { margin-bottom: 12px; }
+.form-group label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+.form-group input, .form-group select { width: 100%; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; }
+.form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+.pagination { display: flex; gap: 8px; align-items: center; justify-content: center; margin-top: 16px; }
+.mono { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; }
+.truncate { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.loading { text-align: center; padding: 40px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔍 BSC Scan Admin</h1>
+  <nav>
+    <button class="active" onclick="showPanel('dashboard')">Dashboard</button>
+    <button onclick="showPanel('endpoints')">Endpoints</button>
+    <button onclick="showPanel('blocks')">Blocks</button>
+    <button onclick="showPanel('contracts')">Contracts</button>
+  </nav>
+</header>
+<main>
+  <div id="stats" class="stats"></div>
+
+  <div id="panel-dashboard" class="panel active">
+    <div class="card"><h3>最近区块</h3><div id="recent-blocks" class="loading">加载中...</div></div>
+    <div class="card"><h3>合约交易</h3><div id="recent-contract-txs" class="loading">加载中...</div></div>
+  </div>
+
+  <div id="panel-endpoints" class="panel">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <h3 style="margin:0">RPC Endpoints</h3>
+        <button class="btn btn-primary btn-sm" onclick="openEndpointModal()">+ 新增</button>
+      </div>
+      <table><thead><tr><th>ID</th><th>URL</th><th>速率/min</th><th>状态</th><th>今日用量</th><th>连续失败</th><th>操作</th></tr></thead><tbody id="endpoint-list"></tbody></table>
+    </div>
+  </div>
+
+  <div id="panel-blocks" class="panel">
+    <div class="card">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+        <select id="block-status-filter" onchange="loadBlocks()">
+          <option value="">全部状态</option><option value="unprocessed">未处理</option><option value="processing">处理中</option><option value="processed">已处理</option>
+        </select>
+      </div>
+      <table><thead><tr><th>区块号</th><th>Hash</th><th>时间</th><th>Tx数</th><th>状态</th><th>处理时间</th></tr></thead><tbody id="block-list"></tbody></table>
+      <div id="block-pagination" class="pagination"></div>
+    </div>
+  </div>
+
+  <div id="panel-contracts" class="panel">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <h3 style="margin:0">监控合约</h3>
+        <button class="btn btn-primary btn-sm" onclick="openContractModal()">+ 新增合约</button>
+      </div>
+      <table><thead><tr><th>地址</th><th>名称</th><th>状态</th><th>操作</th></tr></thead><tbody id="contract-list"></tbody></table>
+    </div>
+  </div>
+</main>
+
+<div id="modal-endpoint" class="modal">
+  <div class="modal-content"><h3 id="modal-endpoint-title">新增 Endpoint</h3>
+    <input type="hidden" id="ep-id">
+    <div class="form-group"><label>URL</label><input id="ep-url" placeholder="https://..."></div>
+    <div class="form-group"><label>速率限制/min</label><input id="ep-rate" type="number" value="60"></div>
+    <div class="form-group"><label>每日上限 (0=无限)</label><input id="ep-daily" type="number" value="0"></div>
+    <div class="form-group"><label>最大连续失败</label><input id="ep-consec-fail" type="number" value="5"></div>
+    <div class="form-group"><label>最大总失败</label><input id="ep-total-fail" type="number" value="0"></div>
+    <div class="form-group"><label>退避初始(s)</label><input id="ep-backoff-init" type="number" value="60"></div>
+    <div class="form-group"><label>退避最大(s)</label><input id="ep-backoff-max" type="number" value="600"></div>
+    <div class="form-actions">
+      <button class="btn" onclick="closeModal('modal-endpoint')">取消</button>
+      <button class="btn btn-primary" onclick="saveEndpoint()">保存</button>
+    </div>
+  </div>
+</div>
+
+<div id="modal-contract" class="modal">
+  <div class="modal-content"><h3 id="modal-contract-title">新增合约</h3>
+    <div class="form-group"><label>合约地址</label><input id="ct-address" placeholder="0x..."></div>
+    <div class="form-group"><label>名称</label><input id="ct-name" placeholder="USDT (BSC)"></div>
+    <div class="form-actions">
+      <button class="btn" onclick="closeModal('modal-contract')">取消</button>
+      <button class="btn btn-primary" onclick="saveContract()">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '/api';
+
+function showPanel(name) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  document.getElementById('panel-'+name).classList.add('active');
+  event.target.classList.add('active');
+  if (name === 'dashboard') { loadStats(); loadDashboard(); }
+  if (name === 'endpoints') loadEndpoints();
+  if (name === 'blocks') loadBlocks();
+  if (name === 'contracts') loadContracts();
+}
+
+async function fetchJSON(url, opts) {
+  const res = await fetch(url, opts);
+  return res.json();
+}
+
+async function loadStats() {
+  const s = await fetchJSON(API+'/stats');
+  document.getElementById('stats').innerHTML = `
+    <div class="stat-card"><div class="label">总区块</div><div class="value">${s.totalBlocks||0}</div></div>
+    <div class="stat-card"><div class="label">已处理</div><div class="value" style="color:var(--green)">${s.processedBlocks||0}</div></div>
+    <div class="stat-card"><div class="label">未处理</div><div class="value" style="color:var(--amber)">${s.unprocessedBlocks||0}</div></div>
+    <div class="stat-card"><div class="label">交易总数</div><div class="value">${s.totalTransactions||0}</div></div>
+    <div class="stat-card"><div class="label">合约交易</div><div class="value" style="color:var(--primary)">${s.contractTransactions||0}</div></div>
+    <div class="stat-card"><div class="label">活跃节点</div><div class="value" style="color:var(--green)">${s.activeEndpoints||0}/${s.endpoints||0}</div></div>
+    <div class="stat-card"><div class="label">监控合约</div><div class="value">${s.monitoredContracts||0}</div></div>
+    <div class="stat-card"><div class="label">最新区块</div><div class="value">#${s.latestBlock||0}</div></div>`;
+}
+
+async function loadDashboard() {
+  const blocks = await fetchJSON(API+'/blocks?limit=5');
+  const tb = (blocks.data||[]).map(b => `<tr><td>${b.number}</td><td class="mono truncate">${b.hash}</td><td>${new Date(b.timestamp*1000).toLocaleString()}</td><td>${b.txCount}</td><td><span class="badge badge-${b.status}">${b.status}</span></td></tr>`).join('');
+  document.getElementById('recent-blocks').innerHTML = tb ? `<table><thead><tr><th>区块号</th><th>Hash</th><th>时间</th><th>Tx数</th><th>状态</th></tr></thead><tbody>${tb}</tbody></table>` : '暂无数据';
+  document.getElementById('recent-contract-txs').innerHTML = '<p style="color:var(--muted)">暂无合约交易</p>';
+}
+
+async function loadEndpoints() {
+  const eps = await fetchJSON(API+'/endpoints');
+  document.getElementById('endpoint-list').innerHTML = eps.map(ep => `<tr>
+    <td>${ep.id}</td><td class="mono truncate" title="${ep.url}">${ep.url}</td><td>${ep.rateLimitPerMinute}</td>
+    <td><span class="badge badge-${ep.isStopped?'stopped':ep.status==='healthy'?'healthy':'unknown'}">${ep.isStopped?'stopped':ep.status}</span></td>
+    <td>${ep.dailyUsed}/${ep.dailyLimit||'∞'}</td><td>${ep.consecutiveFailures}</td>
+    <td>
+      <button class="btn btn-sm" onclick="editEndpoint(${ep.id})">编辑</button>
+      <button class="btn btn-sm btn-danger" onclick="deleteEndpoint(${ep.id})">删除</button>
+      ${ep.isStopped?'':`<button class="btn btn-sm" onclick="stopEndpoint(${ep.id})">停止</button>`}
+    </td></tr>`).join('');
+}
+
+let blockPage = 1;
+async function loadBlocks() {
+  const status = document.getElementById('block-status-filter').value;
+  const data = await fetchJSON(API+'/blocks?page='+blockPage+'&limit=20'+(status?'&status='+status:''));
+  document.getElementById('block-list').innerHTML = (data.data||[]).map(b => `<tr>
+    <td>${b.number}</td><td class="mono truncate">${b.hash}</td>
+    <td>${b.timestamp?new Date(b.timestamp*1000).toLocaleString():'-'}</td>
+    <td>${b.txCount}</td><td><span class="badge badge-${b.status}">${b.status}</span></td>
+    <td>${b.processedAt?new Date(b.processedAt).toLocaleString():'-'}</td></tr>`).join('');
+  document.getElementById('block-pagination').innerHTML = `
+    <button class="btn btn-sm" onclick="blockPage--;loadBlocks()" ${blockPage<=1?'disabled':''}>上一页</button>
+    <span>第 ${blockPage} 页 / 共 ${Math.ceil((data.total||1)/20)} 页</span>
+    <button class="btn btn-sm" onclick="blockPage++;loadBlocks()" ${blockPage>=Math.ceil((data.total||1)/20)?'disabled':''}>下一页</button>`;
+}
+
+async function loadContracts() {
+  const cs = await fetchJSON(API+'/contracts');
+  document.getElementById('contract-list').innerHTML = cs.map(c => `<tr>
+    <td class="mono truncate">${c.address}</td><td>${c.name||'-'}</td>
+    <td><span class="badge badge-${c.active?'healthy':'stopped'}">${c.active?'活跃':'停用'}</span></td>
+    <td>
+      <button class="btn btn-sm btn-danger" onclick="deleteContract('${c.address}')">删除</button>
+    </td></tr>`).join('');
+}
+
+function openEndpointModal(id) {
+  document.getElementById('ep-id').value = id||'';
+  document.getElementById('modal-endpoint-title').textContent = id?'编辑 Endpoint':'新增 Endpoint';
+  if (id) {
+    fetchJSON(API+'/endpoints/'+id).then(ep => {
+      document.getElementById('ep-url').value = ep.url; document.getElementById('ep-rate').value = ep.rateLimitPerMinute;
+      document.getElementById('ep-daily').value = ep.dailyLimit; document.getElementById('ep-consec-fail').value = ep.maxConsecutiveFailures;
+      document.getElementById('ep-total-fail').value = ep.maxTotalFailures; document.getElementById('ep-backoff-init').value = ep.backoffInitial;
+      document.getElementById('ep-backoff-max').value = ep.backoffMax;
+    });
+  } else {
+    ['ep-url','ep-rate','ep-daily','ep-consec-fail','ep-total-fail','ep-backoff-init','ep-backoff-max'].forEach(f => {
+      const el = document.getElementById(f); if (el.tagName === 'INPUT' && el.type === 'number') el.value = f==='ep-rate'?60:f==='ep-consec-fail'?5:f==='ep-backoff-init'?60:f==='ep-backoff-max'?600:0;
+    });
+    document.getElementById('ep-url').value = '';
+  }
+  document.getElementById('modal-endpoint').classList.add('active');
+}
+
+async function saveEndpoint() {
+  const id = document.getElementById('ep-id').value;
+  const body = { url: document.getElementById('ep-url').value, rateLimitPerMinute: +document.getElementById('ep-rate').value,
+    dailyLimit: +document.getElementById('ep-daily').value, maxConsecutiveFailures: +document.getElementById('ep-consec-fail').value,
+    maxTotalFailures: +document.getElementById('ep-total-fail').value, backoffInitial: +document.getElementById('ep-backoff-init').value,
+    backoffMax: +document.getElementById('ep-backoff-max').value };
+  await fetchJSON(API+'/endpoints'+(id?'/'+id:''), { method: id?'PUT':'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  closeModal('modal-endpoint');
+  loadEndpoints();
+}
+
+async function deleteEndpoint(id) { if (confirm('确认删除?')) { await fetch(API+'/endpoints/'+id, {method:'DELETE'}); loadEndpoints(); } }
+async function stopEndpoint(id) { if (confirm('确认停止?')) { await fetch(API+'/endpoints/'+id+'/stop', {method:'POST'}); loadEndpoints(); } }
+
+function editEndpoint(id) { openEndpointModal(id); }
+
+function openContractModal() { document.getElementById('modal-contract').classList.add('active'); }
+async function saveContract() {
+  const addr = document.getElementById('ct-address').value;
+  const name = document.getElementById('ct-name').value;
+  await fetchJSON(API+'/contracts?address='+encodeURIComponent(addr), { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name,active:true}) });
+  closeModal('modal-contract');
+  loadContracts();
+}
+async function deleteContract(addr) { if (confirm('确认删除?')) { await fetch(API+'/contracts/'+addr, {method:'DELETE'}); loadContracts(); } }
+
+function closeModal(id) { document.getElementById(id).classList.remove('active'); }
+
+loadStats();
+loadDashboard();
+</script>
+</body>
+</html>
