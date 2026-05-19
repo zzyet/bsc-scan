@@ -13,10 +13,11 @@ type DatabaseConfig struct {
 }
 
 type ScannerConfig struct {
-	StartBlock   int64         `yaml:"start_block"`
-	WorkerCount  int           `yaml:"worker_count"`
-	BatchSize    int           `yaml:"batch_size"`
-	PollInterval time.Duration `yaml:"poll_interval"`
+	StartBlock     int64         `yaml:"start_block"`
+	WorkerCount    int           `yaml:"worker_count"`
+	BatchSize      int           `yaml:"batch_size"`
+	FetchBatchSize int           `yaml:"fetch_batch_size"`
+	PollInterval   time.Duration `yaml:"poll_interval"`
 }
 
 type Config struct {
@@ -30,11 +31,12 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg := &Config{
+		cfg := &Config{
 		Scanner: ScannerConfig{
-			WorkerCount:  5,
-			BatchSize:    50,
-			PollInterval: 3 * time.Second,
+			WorkerCount:    5,
+			BatchSize:      50,
+			FetchBatchSize: 500,
+			PollInterval:   3 * time.Second,
 		},
 		SyncInterval: 5 * time.Minute,
 	}

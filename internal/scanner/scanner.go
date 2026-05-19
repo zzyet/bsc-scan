@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"bsc-scan/internal/config"
@@ -17,6 +19,13 @@ import (
 	"bsc-scan/internal/monitor"
 	"bsc-scan/internal/store"
 )
+
+// receiptResult holds either a receipt or an error for a single tx.
+type receiptResult struct {
+	receipt *types.Receipt
+	err     error
+	txHash  string // to track which tx it belongs to
+}
 
 // Scanner implements services.Service, coordinating fetch and process phases.
 type Scanner struct {
@@ -59,7 +68,12 @@ func (s *Scanner) Start(ctx context.Context) error {
 	s.wg.Add(1)
 	go s.processLoop()
 
-	log.Printf("[scanner] Started (start_block=%d, workers=%d, batch=%d)", s.cfg.StartBlock, s.cfg.WorkerCount, s.cfg.BatchSize)
+	fetchSize := s.cfg.FetchBatchSize
+	if fetchSize == 0 {
+		fetchSize = 100
+	}
+	log.Printf("[scanner] Started (start_block=%d, workers=%d, batch=%d, fetch_batch=%d)",
+		s.cfg.StartBlock, s.cfg.WorkerCount, s.cfg.BatchSize, fetchSize)
 	return nil
 }
 
@@ -72,9 +86,13 @@ func (s *Scanner) Close() error {
 	return nil
 }
 
-func (s *Scanner) Name() string { return "BlockScanner" }
-func (s *Scanner) Ready() error     { return nil }
+func (s *Scanner) Name() string                { return "BlockScanner" }
+func (s *Scanner) Ready() error                { return nil }
 func (s *Scanner) HealthReport() map[string]error { return map[string]error{"scanner": nil} }
+
+// ---------------------------------------------------------------------------
+// Fetch phase: parallel block metadata fetching
+// ---------------------------------------------------------------------------
 
 func (s *Scanner) fetchLoop() {
 	defer s.wg.Done()
@@ -95,15 +113,16 @@ func (s *Scanner) fetchBlocks() {
 	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
 	defer cancel()
 
-	client, release, err := s.acquireClient(ctx)
+	client, lease, closeFn, err := s.acquireClient(ctx)
 	if err != nil {
 		return
 	}
-	defer release()
+	defer closeFn()
+	defer lease.ReportSuccess()
 
 	chainLatest, err := client.BlockNumber(ctx)
 	if err != nil {
-		release() // Release with failure
+		lease.ReportFailure()
 		log.Printf("[scanner] Failed to get chain block number: %v", err)
 		return
 	}
@@ -119,7 +138,6 @@ func (s *Scanner) fetchBlocks() {
 		if s.cfg.StartBlock > 0 {
 			start = s.cfg.StartBlock
 		} else {
-			// Start from latest block (0 = catch-up mode)
 			start = int64(chainLatest)
 		}
 	}
@@ -128,18 +146,33 @@ func (s *Scanner) fetchBlocks() {
 		return
 	}
 
-	end := start + 99
+	fetchSize := s.cfg.FetchBatchSize
+	if fetchSize <= 0 {
+		fetchSize = 100
+	}
+
+	end := start + int64(fetchSize) - 1
 	if end > int64(chainLatest) {
 		end = int64(chainLatest)
 	}
 
-	log.Printf("[scanner] Fetching blocks %d → %d", start, end)
+	log.Printf("[scanner] Fetching blocks %d → %d (%d blocks)", start, end, end-start+1)
 
 	var blocks []store.Block
 	for num := start; num <= end; num++ {
 		block, err := client.BlockByNumber(ctx, big.NewInt(num))
 		if err != nil {
 			log.Printf("[scanner] Failed to fetch block %d: %v", num, err)
+			// If we hit rate limiting, report failure, switch endpoint and retry
+			if isRateLimit(err) {
+				lease.ReportFailure()
+				closeFn()
+				client, lease, closeFn, err = s.acquireClient(ctx)
+				if err != nil {
+					return
+				}
+				continue
+			}
 			continue
 		}
 		txCount := len(block.Transactions())
@@ -161,6 +194,20 @@ func (s *Scanner) fetchBlocks() {
 		}
 	}
 }
+
+// isRateLimit checks if the error indicates rate limiting (403/429).
+func isRateLimit(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "403") || strings.Contains(msg, "429") ||
+		strings.Contains(msg, "Forbidden") || strings.Contains(msg, "Too Many Requests")
+}
+
+// ---------------------------------------------------------------------------
+// Process phase: parallel receipt fetching + batch RPC + connection reuse
+// ---------------------------------------------------------------------------
 
 func (s *Scanner) processLoop() {
 	defer s.wg.Done()
@@ -187,37 +234,60 @@ func (s *Scanner) processBatch() {
 		return
 	}
 
+	s.processBlocksParallel(blockNums)
+}
+
+func (s *Scanner) processBlocksParallel(blockNums []int64) {
+	// Acquire ONE endpoint and reuse its connection for the entire batch
+	ctx, cancel := context.WithTimeout(s.ctx, 120*time.Second)
+	defer cancel()
+
+	lease, err := s.epMgr.AcquireEndpoint(ctx)
+	if err != nil {
+		log.Printf("[scanner] Failed to acquire endpoint for batch: %v", err)
+		return
+	}
+
+	client, err := ethclient.DialContext(ctx, lease.Config().URL)
+	if err != nil {
+		lease.ReportFailure()
+		log.Printf("[scanner] Failed to dial endpoint: %v", err)
+		return
+	}
+	defer client.Close()
+
+	// Extract underlying rpc.Client for batch receipt calls
+	rpcClient := client.Client()
+
+	// Process blocks with worker pool
 	sem := make(chan struct{}, s.cfg.WorkerCount)
 	var wg sync.WaitGroup
 
 	for _, num := range blockNums {
 		select {
 		case <-s.ctx.Done():
-			return
+			goto done
 		case sem <- struct{}{}:
 		}
 		wg.Add(1)
 		go func(blockNum int64) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			s.processBlock(blockNum)
+
+			blockCtx, blockCancel := context.WithTimeout(ctx, 60*time.Second)
+			defer blockCancel()
+
+			s.processBlockFast(blockCtx, client, rpcClient, blockNum)
 		}(num)
 	}
+done:
 	wg.Wait()
+	lease.ReportSuccess()
 }
 
-func (s *Scanner) processBlock(blockNum int64) {
-	ctx, cancel := context.WithTimeout(s.ctx, 60*time.Second)
-	defer cancel()
-
+// processBlockFast processes a single block using a pre-dialed client.
+func (s *Scanner) processBlockFast(ctx context.Context, client *ethclient.Client, rpcClient *rpc.Client, blockNum int64) {
 	s.batchWriter.UpdateBlockStatus(ctx, blockNum, "processing")
-
-	client, release, err := s.acquireClient(ctx)
-	if err != nil {
-		s.batchWriter.UpdateBlockStatus(ctx, blockNum, "unprocessed")
-		return
-	}
-	defer release()
 
 	block, err := client.BlockByNumber(ctx, big.NewInt(blockNum))
 	if err != nil {
@@ -231,6 +301,9 @@ func (s *Scanner) processBlock(blockNum int64) {
 		return
 	}
 
+	// Fetch all receipts in bulk or parallel
+	receipts := s.fetchReceipts(ctx, client, rpcClient, block)
+
 	chainID := big.NewInt(56) // BSC mainnet
 	signer := types.NewLondonSigner(chainID)
 
@@ -239,7 +312,7 @@ func (s *Scanner) processBlock(blockNum int64) {
 	var contractTxs []store.ContractTx
 	var contractEvents []store.ContractEvent
 
-	for _, tx := range block.Transactions() {
+	for i, tx := range block.Transactions() {
 		toAddr := ""
 		if tx.To() != nil {
 			toAddr = tx.To().Hex()
@@ -261,8 +334,8 @@ func (s *Scanner) processBlock(blockNum int64) {
 			InputData:   fmt.Sprintf("0x%x", tx.Data()),
 		}
 
-		receipt, err := client.TransactionReceipt(ctx, tx.Hash())
-		if err == nil {
+		receipt := receipts[i]
+		if receipt != nil {
 			txRecord.Status = int16(receipt.Status)
 
 			for _, lg := range receipt.Logs {
@@ -289,7 +362,7 @@ func (s *Scanner) processBlock(blockNum int64) {
 		txs = append(txs, txRecord)
 
 		// Contract monitor integration
-		if s.monitor != nil {
+		if s.monitor != nil && receipt != nil {
 			ct, ce := s.monitor.MatchAndParse(tx, receipt, block.Time())
 			if ct != nil {
 				contractTxs = append(contractTxs, *ct)
@@ -314,22 +387,98 @@ func (s *Scanner) processBlock(blockNum int64) {
 	s.batchWriter.UpdateBlockStatus(ctx, blockNum, "processed")
 }
 
+// fetchReceipts tries to get all receipts for a block efficiently.
+// Strategy: try eth_getBlockReceipts (1 RPC call), fall back to parallel TransactionReceipt calls.
+func (s *Scanner) fetchReceipts(ctx context.Context, client *ethclient.Client, rpcClient *rpc.Client, block *types.Block) []*types.Receipt {
+	n := len(block.Transactions())
+	receipts := make([]*types.Receipt, n)
+
+	// Strategy 1: batch RPC eth_getBlockReceipts (single call)
+	if rpcClient != nil {
+		var batchReceipts []*types.Receipt
+		blockNumHex := fmt.Sprintf("0x%x", block.Number().Int64())
+		if err := rpcClient.CallContext(ctx, &batchReceipts, "eth_getBlockReceipts", blockNumHex); err == nil {
+			// Map receipts back to tx index
+			txHashMap := make(map[string]int, n)
+			for i, tx := range block.Transactions() {
+				txHashMap[tx.Hash().Hex()] = i
+			}
+			for _, r := range batchReceipts {
+				if idx, ok := txHashMap[r.TxHash.Hex()]; ok {
+					receipts[idx] = r
+				}
+			}
+			return receipts
+		}
+	}
+
+	// Strategy 2: parallel TransactionReceipt calls
+	concurrency := 20 // parallel receipt fetchers
+	sem := make(chan struct{}, concurrency)
+
+	type result struct {
+		idx     int
+		receipt *types.Receipt
+	}
+	resultCh := make(chan result, n)
+
+	var wg sync.WaitGroup
+	for i, tx := range block.Transactions() {
+		select {
+		case <-ctx.Done():
+			goto waitDone
+		case sem <- struct{}{}:
+		}
+		wg.Add(1)
+		go func(idx int, txHash string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			r, err := client.TransactionReceipt(ctx, block.Transactions()[idx].Hash())
+			if err != nil {
+				// Log only first error per block to reduce noise
+				return
+			}
+			resultCh <- result{idx: idx, receipt: r}
+		}(i, tx.Hash().Hex())
+	}
+waitDone:
+	wg.Wait()
+	close(resultCh)
+
+	for r := range resultCh {
+		receipts[r.idx] = r.receipt
+	}
+
+	return receipts
+}
+
 // acquireClient gets a client from the endpoint manager lease pool.
-func (s *Scanner) acquireClient(ctx context.Context) (*ethclient.Client, func(), error) {
+// Returns the client, the lease (for manual reporting), and a release function.
+func (s *Scanner) acquireClient(ctx context.Context) (*ethclient.Client, *endpoint.Lease, func(), error) {
 	lease, err := s.epMgr.AcquireEndpoint(ctx)
 	if err != nil {
-		return nil, func() {}, fmt.Errorf("acquire endpoint: %w", err)
+		return nil, nil, func() {}, fmt.Errorf("acquire endpoint: %w", err)
 	}
 
 	client, err := ethclient.DialContext(ctx, lease.Config().URL)
 	if err != nil {
 		lease.ReportFailure()
-		return nil, func() {}, err
+		return nil, lease, func() {}, err
 	}
 
+	return client, lease, func() { client.Close() }, nil
+}
+
+// acquireClientSimple gets a client with auto-success reporting (for legacy/process code).
+func (s *Scanner) acquireClientSimple(ctx context.Context) (*ethclient.Client, func(), error) {
+	client, lease, closeFn, err := s.acquireClient(ctx)
+	if err != nil {
+		return nil, func() {}, err
+	}
 	release := func() {
 		lease.ReportSuccess()
-		client.Close()
+		closeFn()
 	}
 	return client, release, nil
 }
